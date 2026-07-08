@@ -12,9 +12,9 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-   allow_origins=[
+  allow_origins=[
     "http://localhost:5500",
-    "https://your-netlify-site.netlify.app",  # we'll fill this in after Netlify deploy
+    "https://quantum-alpha-radar.netlify.app",
 ],
     allow_credentials=True,
     allow_methods=["*"],
