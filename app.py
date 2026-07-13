@@ -12,10 +12,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-  allow_origins=[
-    "http://localhost:5500",
-    "https://quantum-alpha-radar.netlify.app",
-],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -118,6 +115,22 @@ def get_nifty50_tickers():
     except Exception:
         pass
     return NIFTY50_FALLBACK
+
+
+def normalize_symbol(raw):
+    """
+    Turns loose user input ("reliance", "nifty", "tcs.ns") into a proper
+    yfinance ticker. Recognizes NIFTY/SENSEX by name; otherwise assumes an
+    NSE equity and appends .NS unless the user already gave a suffix/index.
+    """
+    s = (raw or "").strip().upper()
+    if s in ("NIFTY", "NIFTY50", "NIFTY 50", "^NSEI"):
+        return "^NSEI"
+    if s in ("SENSEX", "BSESN", "^BSESN"):
+        return "^BSESN"
+    if s.startswith("^") or s.endswith(".NS"):
+        return s
+    return f"{s}.NS"
 
 
 def _next_weekday(target_weekday, from_date):
@@ -259,8 +272,6 @@ def analyze_market_matrix(ticker_symbol):
 
         option_entry = black_scholes_price(current_price, strike_price, T, r, sigma, option_type)
 
-        # Size SL/target off the option premium's own expected move, not the
-        # underlying's ATR (options don't move points-for-point with spot).
         premium_move_proxy = max(option_entry * sigma * math.sqrt(1 / 365) * 2, option_entry * 0.08)
         option_sl_points = round(premium_move_proxy * 0.9, 2)
         option_target_points = round(premium_move_proxy * 1.8, 2)
@@ -463,6 +474,181 @@ def fetch_market_news(limit_per_feed=8):
 
 
 # ============================================================================
+# 5. TIP CHECKER — verify a tip you received (option CE/PE or a share) against
+#    the same trend/momentum rules used elsewhere in this app. This is a
+#    consistency check against the app's own signals, not independent
+#    verification of the tip's source or a guarantee of outcome.
+# ============================================================================
+
+def verify_option_tip_logic(ticker_symbol, option_type, strike=None):
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        df = ticker.history(period="5d", interval="5m")
+    except Exception:
+        return {"error": f"Could not fetch live data for {ticker_symbol}."}
+
+    if df.empty or len(df) < 30:
+        return {"error": f"Not enough live intraday data available for {ticker_symbol} right now."}
+
+    df['EMA_Fast'] = df['Close'].ewm(span=9, adjust=False).mean()
+    df['EMA_Slow'] = df['Close'].ewm(span=21, adjust=False).mean()
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / (loss + 1e-10)
+    df['RSI'] = 100 - (100 / (1 + rs))
+    df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
+
+    latest = df.iloc[-1]
+    current_price = round(latest['Close'], 2)
+    rsi = latest['RSI'] if not pd.isna(latest['RSI']) else 50.0
+    volume_burst = bool(not pd.isna(latest['Vol_MA']) and latest['Volume'] > (latest['Vol_MA'] * 1.2))
+    trend_bullish = bool(latest['EMA_Fast'] > latest['EMA_Slow'])
+
+    if not strike or strike <= 0:
+        strike_base = 50 if ticker_symbol == "^NSEI" else (100 if ticker_symbol == "^BSESN" else max(round(current_price * 0.01 / 5) * 5, 5))
+        strike = int(round(current_price / strike_base) * strike_base)
+
+    moneyness = "ATM"
+    if option_type == "CE":
+        if strike < current_price * 0.98:
+            moneyness = "ITM"
+        elif strike > current_price * 1.02:
+            moneyness = "OTM"
+    else:
+        if strike > current_price * 1.02:
+            moneyness = "ITM"
+        elif strike < current_price * 0.98:
+            moneyness = "OTM"
+
+    expiry_date, days_to_expiry = get_nearest_expiry(ticker_symbol)
+    T = days_to_expiry / 365
+    sigma = estimate_annualized_volatility(df)
+    fair_premium = black_scholes_price(current_price, strike, T, 0.065, sigma, option_type)
+
+    momentum_supports = (option_type == "CE" and trend_bullish) or (option_type == "PE" and not trend_bullish)
+    rsi_supports = (50 < rsi < 68) if option_type == "CE" else (32 < rsi < 50)
+
+    reasons = []
+    reasons.append(
+        f"Short-term trend (9/21 EMA) is currently {'bullish' if trend_bullish else 'bearish'} — "
+        f"{'this lines up with' if momentum_supports else 'this works against'} a {option_type} buy right now."
+    )
+
+    if option_type == "CE":
+        if rsi >= 68:
+            reasons.append(f"RSI is {round(rsi, 1)} — already overbought, chasing a CE here risks a pullback.")
+        elif rsi_supports:
+            reasons.append(f"RSI is {round(rsi, 1)}, in a healthy bullish zone (not yet overbought).")
+        else:
+            reasons.append(f"RSI is {round(rsi, 1)} — doesn't show bullish strength yet.")
+    else:
+        if rsi <= 32:
+            reasons.append(f"RSI is {round(rsi, 1)} — already oversold, chasing a PE here risks a bounce.")
+        elif rsi_supports:
+            reasons.append(f"RSI is {round(rsi, 1)}, in a healthy bearish zone (not yet oversold).")
+        else:
+            reasons.append(f"RSI is {round(rsi, 1)} — doesn't show bearish strength yet.")
+
+    reasons.append(
+        "Volume is running above its recent average, supporting the current move."
+        if volume_burst else
+        "Volume isn't confirming a strong move right now — the signal is weaker without it."
+    )
+
+    if moneyness == "OTM":
+        reasons.append(f"Strike {strike} is OTM — cheaper premium, but needs a bigger move to turn profitable and decays faster.")
+    elif moneyness == "ITM":
+        reasons.append(f"Strike {strike} is ITM — costlier premium, but higher delta means it tracks the underlying more closely.")
+    else:
+        reasons.append(f"Strike {strike} is roughly ATM — balanced between cost and sensitivity to a move.")
+
+    score = sum([momentum_supports, rsi_supports, volume_burst])
+    if score >= 3:
+        verdict = "Aligned with current momentum"
+    elif score == 2:
+        verdict = "Partially aligned — proceed with caution"
+    else:
+        verdict = "Not aligned with current momentum — high risk"
+
+    return {
+        "symbol": ticker_symbol.replace(".NS", ""),
+        "current_price": current_price,
+        "option_type": option_type,
+        "strike": strike,
+        "moneyness": moneyness,
+        "expiry": expiry_date.strftime("%d-%b-%Y"),
+        "estimated_fair_premium": fair_premium,
+        "verdict": verdict,
+        "reasons": reasons,
+    }
+
+
+def verify_share_tip_logic(ticker_symbol):
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        df = ticker.history(period="1y", interval="1d")
+    except Exception:
+        return {"error": f"Could not fetch data for {ticker_symbol}."}
+
+    if df.empty or len(df) < 60:
+        return {"error": f"Not enough historical data available for {ticker_symbol}."}
+
+    current_price = round(df['Close'].iloc[-1], 2)
+    sma_50 = df['Close'].rolling(window=50).mean().iloc[-1]
+    sma_200 = df['Close'].rolling(window=200).mean().iloc[-1] if len(df) >= 200 else sma_50
+    atr_daily = (df['High'] - df['Low']).rolling(window=14).mean().iloc[-1]
+
+    earnings_growth = None
+    try:
+        qf = ticker.quarterly_financials
+        if not qf.empty and "Net Income" in qf.index and qf.shape[1] >= 2:
+            earnings_growth = qf.loc["Net Income"].iloc[0] > qf.loc["Net Income"].iloc[1]
+    except Exception:
+        pass
+
+    trend_up = bool(current_price > sma_50)
+    long_term_up = bool(current_price > sma_200)
+
+    reasons = [
+        f"Price (₹{current_price}) is {'above' if trend_up else 'below'} its 50-day average "
+        f"(₹{round(sma_50, 2)}) — {'a short-term uptrend' if trend_up else 'a short-term downtrend'}.",
+        f"Price is {'above' if long_term_up else 'below'} its 200-day average "
+        f"(₹{round(sma_200, 2)}) — {'a healthy long-term trend' if long_term_up else 'a weak long-term trend'}.",
+    ]
+
+    if earnings_growth is True:
+        reasons.append("Most recent quarterly net income grew versus the prior quarter.")
+    elif earnings_growth is False:
+        reasons.append("Most recent quarterly net income declined versus the prior quarter — a headwind for the case.")
+    else:
+        reasons.append("Recent earnings data wasn't available to verify — treat that check as unresolved.")
+
+    if trend_up and earnings_growth is not False:
+        verdict = "Buy case supported"
+    elif trend_up:
+        verdict = "Partially supported — trend is up but earnings unconfirmed"
+    elif long_term_up:
+        verdict = "Mixed — long-term trend intact but short-term trend is weak"
+    else:
+        verdict = "Not supported right now — trend is weak"
+
+    buying_range = f"₹{round(current_price * 0.99, 1)} - ₹{round(current_price * 1.01, 1)}"
+    stop_loss = round(current_price - (2.2 * atr_daily), 2) if not pd.isna(atr_daily) and atr_daily > 0 else None
+    target = round(current_price + (4.5 * atr_daily), 2) if not pd.isna(atr_daily) and atr_daily > 0 else None
+
+    return {
+        "symbol": ticker_symbol.replace(".NS", ""),
+        "current_price": current_price,
+        "verdict": verdict,
+        "reasons": reasons,
+        "suggested_buying_range": buying_range,
+        "suggested_stop_loss": stop_loss,
+        "suggested_target": target,
+    }
+
+
+# ============================================================================
 # API ROUTES
 # ============================================================================
 
@@ -487,8 +673,6 @@ def get_market_signals():
             if not res or res.get("signal") == "NO DATA":
                 continue
             is_core = symbol in CORE_INDEX_SYMBOLS
-            # Compulsory indices always show, even with NO SIGNAL. Everything
-            # else only shows if it currently has real momentum — no static list.
             if is_core or res.get("signal") != "NO SIGNAL":
                 results.append(res)
 
@@ -535,6 +719,21 @@ def get_market_news():
         "neutral": neutral,
         "all": news,
     }
+
+
+@app.get("/api/verify-option-tip")
+def verify_option_tip(symbol: str, option_type: str, strike: float = None):
+    option_type = (option_type or "").strip().upper()
+    if option_type not in ("CE", "PE"):
+        return {"error": "option_type must be CE or PE"}
+    ticker_symbol = normalize_symbol(symbol)
+    return verify_option_tip_logic(ticker_symbol, option_type, strike)
+
+
+@app.get("/api/verify-share-tip")
+def verify_share_tip(symbol: str):
+    ticker_symbol = normalize_symbol(symbol)
+    return verify_share_tip_logic(ticker_symbol)
 
 
 if __name__ == "__main__":
